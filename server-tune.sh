@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+# MazuGate high-load server tuning (Ubuntu 22/24). By Mazu • Programmed by t.me/ozozz
+#   telemtg-tune        -> full tuning (sysctl, limits, conntrack, NIC, swap, time sync)
+#   telemtg-tune nic    -> NIC only (run at every boot by telemtg-tune.service)
+#   telemtg-tune check  -> print current state
+set -u
+MODE="${1:-all}"
+
+G='\033[1;32m'; Y='\033[1;33m'; N='\033[0m'
+MG_LANG="${MG_LANG:-$(cat /etc/telemtg/lang 2>/dev/null || echo ar)}"
+t()    { if [ "$MG_LANG" = "en" ]; then printf '%s' "$2"; else printf '%s' "$1"; fi; }
+ok()   { printf "  ${G}✔${N} %b\n" "$*"; }
+warn() { printf "  ${Y}⚠${N} %b\n" "$*"; }
+
+NCPU="$(nproc)"
+MEM_KB="$(awk '/MemTotal/{print $2}' /proc/meminfo)"
+MEM_MB=$(( MEM_KB / 1024 ))
+PAGES=$(( MEM_KB / 4 ))
+IFACE="$(awk '$2=="00000000"{print $1; exit}' /proc/net/route)"
+
+clamp() { local v=$1 lo=$2 hi=$3; [ "$v" -lt "$lo" ] && v=$lo; [ "$v" -gt "$hi" ] && v=$hi; echo "$v"; }
+
+cpu_mask() { # hex mask of all CPUs, comma-grouped per 32 CPUs (sysfs format)
+    python3 - "$NCPU" <<'PY'
+import sys
+n = int(sys.argv[1]); m = (1 << n) - 1; groups = []
+while True:
+    groups.append("%08x" % (m & 0xffffffff)); m >>= 32
+    if not m: break
+print(",".join(reversed(groups)))
+PY
+}
+
+tune_nic() {
+    [ -n "$IFACE" ] || { warn "$(t "ماكو كارت شبكة افتراضي" "no default network interface")"; return; }
+    command -v ethtool >/dev/null || return
+    # 1) biggest ring buffers the NIC supports (absorbs bursts, fewer drops)
+    local rxmax txmax
+    rxmax="$(ethtool -g "$IFACE" 2>/dev/null | awk '/Pre-set maximums/{f=1} f&&/^RX:/{print $2; exit}')"
+    txmax="$(ethtool -g "$IFACE" 2>/dev/null | awk '/Pre-set maximums/{f=1} f&&/^TX:/{print $2; exit}')"
+    [[ "$rxmax" =~ ^[0-9]+$ ]] && ethtool -G "$IFACE" rx "$rxmax" 2>/dev/null
+    [[ "$txmax" =~ ^[0-9]+$ ]] && ethtool -G "$IFACE" tx "$txmax" 2>/dev/null
+    # 2) use all hardware queues (multi-queue NIC spreads load over CPU cores)
+    local qmax
+    qmax="$(ethtool -l "$IFACE" 2>/dev/null | awk '/Pre-set maximums/{f=1} f&&/^Combined:/{print $2; exit}')"
+    if [[ "$qmax" =~ ^[0-9]+$ ]] && [ "$qmax" -gt 1 ]; then
+        ethtool -L "$IFACE" combined "$(( qmax < NCPU ? qmax : NCPU ))" 2>/dev/null
+    fi
+    # 3) offloads: less CPU per packet
+    for f in gro gso tso; do ethtool -K "$IFACE" "$f" on 2>/dev/null; done
+    ip link set dev "$IFACE" txqueuelen 10000 2>/dev/null
+    # 4) RPS/RFS: spread packet processing over all cores when the NIC has
+    #    fewer queues than CPUs (typical for VPS virtio NICs)
+    local rxq nrx mask flows
+    nrx="$(ls -d /sys/class/net/"$IFACE"/queues/rx-* 2>/dev/null | wc -l)"
+    if [ "$nrx" -gt 0 ] && [ "$nrx" -lt "$NCPU" ]; then
+        mask="$(cpu_mask)"
+        flows=$(( 65536 / nrx ))
+        for rxq in /sys/class/net/"$IFACE"/queues/rx-*; do
+            echo "$mask" > "$rxq/rps_cpus" 2>/dev/null
+            echo "$flows" > "$rxq/rps_flow_cnt" 2>/dev/null
+        done
+        for txq in /sys/class/net/"$IFACE"/queues/tx-*; do
+            echo "$mask" > "$txq/xps_cpus" 2>/dev/null
+        done
+    fi
+    ok "$(t "كارت الشبكة" "Network card") $IFACE: rings=${rxmax:-?}/${txmax:-?} queues=${qmax:-1} rps=$([ "$nrx" -lt "$NCPU" ] && echo on || echo hw)"
+}
+
+if [ "$MODE" = "nic" ]; then tune_nic; exit 0; fi
+
+if [ "$MODE" = "check" ]; then
+    echo "CPU: $NCPU | RAM: ${MEM_MB}MB | NIC: ${IFACE:-?} $(ethtool "$IFACE" 2>/dev/null | awk '/Speed/{print $2}')"
+    echo "AES-NI: $(grep -qw aes /proc/cpuinfo && echo yes || echo NO)"
+    sysctl net.core.somaxconn fs.file-max net.ipv4.tcp_congestion_control net.ipv4.tcp_mem 2>/dev/null
+    sysctl net.netfilter.nf_conntrack_max net.netfilter.nf_conntrack_count 2>/dev/null
+    cat /proc/sys/fs/file-nr; ss -s | head -2
+    exit 0
+fi
+
+[ "$(id -u)" -eq 0 ] || { echo "run as root"; exit 1; }
+
+# ---------------------------------------------------------- packages ----
+export DEBIAN_FRONTEND=noninteractive
+apt-get install -y -qq ethtool irqbalance >/dev/null 2>&1 || warn "$(t "ما كدرت أنصب ethtool/irqbalance" "could not install ethtool/irqbalance")"
+systemctl enable --now irqbalance >/dev/null 2>&1 || true
+
+# ------------------------------------------------------ kernel modules --
+mkdir -p /etc/modules-load.d /etc/modprobe.d /etc/sysctl.d /etc/security/limits.d
+cat > /etc/modules-load.d/telemtg.conf <<'EOF'
+tcp_bbr
+nf_conntrack
+EOF
+modprobe tcp_bbr 2>/dev/null || true
+modprobe nf_conntrack 2>/dev/null || true
+
+CT_MAX="$(clamp $(( MEM_MB * 128 )) 262144 2097152)"
+CT_HASH=$(( CT_MAX / 4 ))
+echo "options nf_conntrack hashsize=$CT_HASH" > /etc/modprobe.d/telemtg-conntrack.conf
+[ -w /sys/module/nf_conntrack/parameters/hashsize ] && echo "$CT_HASH" > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null
+
+# ------------------------------------------------------------- sysctl ---
+TCP_MEM="$(( PAGES * 12 / 100 )) $(( PAGES * 25 / 100 )) $(( PAGES * 40 / 100 ))"
+MIN_FREE="$(clamp $(( MEM_KB / 100 )) 65536 262144)"
+{
+    echo "# generated by telemtg-tune for ${NCPU} CPU / ${MEM_MB}MB RAM"
+    echo "# --- file descriptors (every connection = 1 fd)"
+    echo "fs.file-max = 4194304"
+    echo "fs.nr_open = 4194304"
+    echo "# --- accept queues: absorb connection storms without refusing users"
+    echo "net.core.somaxconn = 65535"
+    echo "net.ipv4.tcp_max_syn_backlog = 262144"
+    echo "net.ipv4.tcp_syncookies = 1"
+    echo "net.ipv4.tcp_synack_retries = 3"
+    echo "# --- packet processing"
+    echo "net.core.netdev_max_backlog = 250000"
+    echo "net.core.netdev_budget = 600"
+    echo "net.core.netdev_budget_usecs = 8000"
+    echo "net.core.rps_sock_flow_entries = 65536"
+    echo "net.core.optmem_max = 65536"
+    echo "# --- buffers (ceilings, not per-socket allocation)"
+    echo "net.core.rmem_default = 262144"
+    echo "net.core.wmem_default = 262144"
+    echo "net.core.rmem_max = 16777216"
+    echo "net.core.wmem_max = 16777216"
+    echo "net.ipv4.tcp_rmem = 4096 87380 16777216"
+    echo "net.ipv4.tcp_wmem = 4096 65536 16777216"
+    echo "net.ipv4.tcp_mem = $TCP_MEM"
+    echo "net.ipv4.tcp_notsent_lowat = 131072"
+    echo "net.ipv4.tcp_slow_start_after_idle = 0"
+    echo "net.ipv4.tcp_mtu_probing = 1"
+    echo "net.ipv4.tcp_fastopen = 3"
+    echo "# --- many sockets: ports, TIME-WAIT, orphans, dead peers"
+    echo "net.ipv4.ip_local_port_range = 10000 65535"
+    echo "net.ipv4.tcp_tw_reuse = 1"
+    echo "net.ipv4.tcp_max_tw_buckets = 2000000"
+    echo "net.ipv4.tcp_fin_timeout = 15"
+    echo "net.ipv4.tcp_max_orphans = 262144"
+    echo "net.ipv4.tcp_orphan_retries = 2"
+    echo "net.ipv4.tcp_retries2 = 10"
+    echo "net.ipv4.tcp_keepalive_time = 300"
+    echo "net.ipv4.tcp_keepalive_intvl = 30"
+    echo "net.ipv4.tcp_keepalive_probes = 5"
+    echo "net.ipv4.tcp_rfc1337 = 1"
+    echo "# --- conntrack (proxy port itself is set to notrack by telemt)"
+    echo "net.netfilter.nf_conntrack_max = $CT_MAX"
+    echo "net.netfilter.nf_conntrack_tcp_timeout_established = 3600"
+    echo "net.netfilter.nf_conntrack_tcp_timeout_time_wait = 12"
+    echo "net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 15"
+    echo "# --- memory"
+    echo "vm.swappiness = 10"
+    echo "vm.min_free_kbytes = $MIN_FREE"
+    echo "vm.max_map_count = 262144"
+    if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+        echo "# --- congestion control"
+        echo "net.core.default_qdisc = fq"
+        echo "net.ipv4.tcp_congestion_control = bbr"
+    fi
+} > /etc/sysctl.d/99-telemtg.conf
+sysctl -q -p /etc/sysctl.d/99-telemtg.conf >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-telemtg.conf 2>&1 | grep -i "error\|invalid" | head -5
+ok "$(t "إعدادات الكيرنل" "Kernel settings") (BBR=$(sysctl -n net.ipv4.tcp_congestion_control), conntrack=$CT_MAX, backlog=65535)"
+
+# ------------------------------------------------------------- limits ---
+cat > /etc/security/limits.d/99-telemtg.conf <<'EOF'
+*    soft nofile 1048576
+*    hard nofile 1048576
+root soft nofile 1048576
+root hard nofile 1048576
+*    soft nproc  65535
+*    hard nproc  65535
+EOF
+mkdir -p /etc/systemd/system.conf.d
+cat > /etc/systemd/system.conf.d/99-telemtg.conf <<'EOF'
+[Manager]
+DefaultLimitNOFILE=1048576
+DefaultTasksMax=infinity
+EOF
+ok "$(t "حدود الملفات المفتوحة" "Open-file limit"): 1048576"
+
+# -------------------------------------------------------- journald ------
+mkdir -p /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/99-telemtg.conf <<'EOF'
+[Journal]
+SystemMaxUse=300M
+RateLimitIntervalSec=30s
+RateLimitBurst=2000
+EOF
+systemctl restart systemd-journald 2>/dev/null || true
+
+# ------------------------------------------------------------ swap ------
+if [ "$(awk '/SwapTotal/{print $2}' /proc/meminfo)" -eq 0 ] && [ "$MEM_MB" -lt 8192 ] && [ ! -e /swapfile ]; then
+    FREE_MB="$(df -Pm / | awk 'NR==2{print $4}')"
+    if [ "$FREE_MB" -gt 6144 ]; then
+        fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none
+        chmod 600 /swapfile
+        if mkswap -q /swapfile && swapon /swapfile; then
+            grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+            ok "$(t "سويت swap احتياطي 2GB" "Created a 2GB safety swap")"
+        else
+            rm -f /swapfile
+        fi
+    fi
+fi
+
+# --------------------------------------------------------- time sync ----
+timedatectl set-ntp true 2>/dev/null || true
+ok "$(t "مزامنة الوقت مفعلة" "Time sync enabled")"
+
+# ------------------------------------------------------- NIC (boot) -----
+install -m 755 "$0" /usr/local/sbin/telemtg-tune 2>/dev/null || true
+cat > /etc/systemd/system/telemtg-tune.service <<'EOF'
+[Unit]
+Description=MazuGate NIC tuning (rings, queues, RPS)
+After=network-online.target
+Wants=network-online.target
+Before=telemt.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/telemtg-tune nic
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable -q telemtg-tune.service 2>/dev/null || true
+tune_nic
